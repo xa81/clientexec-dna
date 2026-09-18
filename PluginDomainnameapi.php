@@ -102,21 +102,90 @@ class PluginDomainnameapi extends RegistrarPlugin
         $result = $this->api->CheckAvailability([$params['sld']], $tldList, '1', 'create');
         $this->logCall();
 
+        // NameSuggest sends one entry per configured TLD, and a reseller that
+        // imported the DNA price list has hundreds of them — well past the 20
+        // domains the gateway accepts per bulk search, and slow enough on the
+        // way there to hit the client's 30s timeout. Rather than fail the whole
+        // lookup, drop the cross-sell suggestions and ask again for the single
+        // TLD the customer actually typed: a narrower query is both inside the
+        // cap and an order of magnitude faster. (BUG-10773)
+        if ($this->isApiError($result) && count($tldList) > 1 && $this->narrowingMayHelp($result)) {
+            $result = $this->api->CheckAvailability([$params['sld']], [$params['tld']], '1', 'create');
+            $this->logCall();
+        }
 
-        if (is_array($result)) {
-            foreach ($result as $results) {
-                $status    = ($results['Status'] == 'notavailable') ? 1 : 0;
-                $domains[] = [
-                    'tld'    => $results['TLD'],
-                    'domain' => $results['DomainName'],
-                    'status' => $status
-                ];
-            }
-        } else {
-            throw new Exception($result['error']['Message'] . "\n" . $result['error']['Details']);
+        // CheckAvailability() answers with either a list of rows or an error
+        // envelope (['result' => 'ERROR', 'error' => [...]]). Both are arrays,
+        // so the old is_array() test never reached its throw: it walked the
+        // envelope instead and read offsets off the string 'ERROR'. On PHP 8
+        // that is an uncaught TypeError — not an Exception — so ClientExec
+        // cannot catch it, the lookup response dies mid-flight and the
+        // customer is left on a spinner that never resolves. (BUG-10773)
+        if ($this->isApiError($result)) {
+            throw new CE_Exception($this->formatApiError($result));
+        }
+
+        foreach ($result as $results) {
+            $status    = ($results['Status'] == 'notavailable') ? 1 : 0;
+            $domains[] = [
+                'tld'    => $results['TLD'],
+                'domain' => $results['DomainName'],
+                'status' => $status
+            ];
         }
 
         return ['result' => $domains];
+    }
+
+    /**
+     * A library call failed when it answers with an error envelope instead of
+     * its normal payload, or with nothing usable at all.
+     *
+     * @param mixed $result
+     * @return bool
+     */
+    private function isApiError($result)
+    {
+        return !is_array($result) || isset($result['result']);
+    }
+
+    /**
+     * Would asking for fewer domains plausibly change the outcome?
+     *
+     * Size- and duration-driven failures (the bulk-search cap, timeouts,
+     * gateway 5xx) clear up with a smaller query. A rejected key, an empty
+     * balance or a throttled account do not — and retrying a throttled account
+     * straight away only adds to the pressure that caused the 429.
+     *
+     * @param array $result
+     * @return bool
+     */
+    private function narrowingMayHelp($result)
+    {
+        $code = (string) ($result['error']['Code'] ?? '');
+        preg_match('/(\d+)/', $code, $m);
+
+        return !in_array($m[1] ?? '', ['401', '402', '429'], true);
+    }
+
+    /**
+     * The API's own wording for an error envelope. Message and Details are
+     * frequently identical, so only add Details when it says something new.
+     *
+     * @param mixed $result
+     * @return string
+     */
+    private function formatApiError($result)
+    {
+        $error   = (is_array($result) && isset($result['error'])) ? $result['error'] : [];
+        $message = trim((string) ($error['Message'] ?? ''));
+        $details = trim((string) ($error['Details'] ?? ''));
+
+        if ($details !== '' && $details !== $message) {
+            $message = trim($message . "\n" . $details);
+        }
+
+        return $message !== '' ? $message : lang('Domain availability check failed.');
     }
 
     /**
